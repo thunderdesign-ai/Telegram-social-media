@@ -43,6 +43,12 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           GIST_ID: ${{ secrets.GIST_ID }}
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          ADMIN_IDS: ${{ vars.ADMIN_IDS }}
+          CHANNEL_ID: ${{ vars.CHANNEL_ID }}
+          CHANNEL_URL: ${{ vars.CHANNEL_URL }}
+          STORAGE_CHAT: ${{ vars.STORAGE_CHAT }}
+          LOG_CHAT: ${{ vars.LOG_CHAT }}
           RATE_LIMIT: "5"
           RUN_SECONDS: "21300"
         run: python bot.py
+      
