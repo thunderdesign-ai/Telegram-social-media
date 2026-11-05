@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 
@@ -37,6 +38,10 @@ DOMAINS = (
     "x.com", "facebook.com", "fb.watch", "reddit.com", "pinterest.com",
     "pin.it", "vimeo.com", "threads.net", "twitch.tv", "dailymotion.com",
 )
+FOOTER = "\n\n✨ Thank you for using ThunderDL by wondermayank.in"
+WEBSITE = "https://wondermayank.in"
+CONTACT = "https://t.me/mindmaster_robot"
+MADE_BY = "https://t.me/wondermayank"
 METHOD = {"photo": "sendPhoto", "video": "sendVideo", "audio": "sendAudio", "document": "sendDocument"}
 
 lock = threading.Lock()
@@ -259,6 +264,45 @@ def page_fallback(url, outdir):
     raise RuntimeError("image download failed")
 
 
+last_report = {}
+
+
+def new_code(raw):
+    return "E" + hashlib.md5((raw + str(time.time())).encode()).hexdigest()[:5].upper()
+
+
+def report_error(code, where, uid, url, raw):
+    """Send the error details to the owner (same error is grouped for 2 minutes)."""
+    key = raw[:80]
+    now = time.time()
+    with lock:
+        if now - last_report.get(key, 0) < 120:
+            return
+        last_report[key] = now
+    text = f"⚠️ ThunderDL error {code}\nWhere: {where}\nUser: {uid}\nLink: {url}\n\n{raw[:1500]}"
+    for a in ADMINS:
+        say(a, text)
+
+
+def is_image_only(url):
+    """True when the post is a plain image (so we skip the video/audio buttons)."""
+    host = (urlparse(url).hostname or "").lower()
+    if not ("pinterest" in host or host == "pin.it" or host.endswith(".pin.it") or "instagram.com" in host):
+        return False
+    try:
+        with YoutubeDL({"quiet": True, "no_warnings": True, "noplaylist": True, "socket_timeout": 20}) as y:
+            info = y.extract_info(url, download=False)
+        first = info
+        if info.get("entries"):
+            first = next((e for e in info["entries"] if e), {})
+        return not first.get("formats") and not first.get("url")
+    except Exception as e:
+        msg = str(e).lower()
+        if "pinterest" in host or host.endswith("pin.it"):
+            return True
+        return "no video" in msg
+
+
 def compress(path):
     try:
         out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -281,23 +325,32 @@ def compress(path):
 
 
 def prepare(url, mode, tmp):
+    """Returns (files, caption, error). error is None or {"user", "raw", "report"}."""
     host = (urlparse(url).hostname or "").lower()
-    try:
-        files, title, uploader = download(url, tmp, mode)
-    except Exception as e:
-        err = str(e)
-        files = None
-        if mode != "audio" and "youtu" not in host:
-            try:
-                files, title, uploader = page_fallback(url, tmp)
-            except Exception as e2:
-                print("fallback failed:", e2)
-        if not files:
-            if "youtu" in host and ("Sign in" in err or "bot" in err):
-                return [], "", "YouTube is blocking this server right now. Please try another site or try again later."
-            return [], "", f"Failed: {err[:300]}"
+    files, title, uploader = None, "", ""
+    if mode == "image":
+        try:
+            files, title, uploader = page_fallback(url, tmp)
+        except Exception as e:
+            return [], "", {"user": "Couldn't fetch this image.", "raw": str(e), "report": True}
+    else:
+        try:
+            files, title, uploader = download(url, tmp, mode)
+        except Exception as e:
+            raw = str(e)
+            if mode not in ("audio", "mute") and "youtu" not in host:
+                try:
+                    files, title, uploader = page_fallback(url, tmp)
+                except Exception as e2:
+                    print("fallback failed:", e2)
+            if not files:
+                if "youtu" in host and ("Sign in" in raw or "bot" in raw):
+                    return [], "", {"user": "YouTube is blocking this server right now. Please try again later.",
+                                    "raw": raw, "report": True}
+                return [], "", {"user": "Couldn't download this link. It may be private, removed or unsupported.",
+                                "raw": raw, "report": True}
     if not files:
-        return [], "", "Nothing found to download."
+        return [], "", {"user": "Nothing found to download.", "raw": "no files", "report": False}
     ready = []
     for f in files:
         if os.path.getsize(f) > MAX_BYTES and kind_of(f) == "video":
@@ -305,9 +358,14 @@ def prepare(url, mode, tmp):
         if os.path.getsize(f) <= MAX_BYTES:
             ready.append(f)
     if not ready:
-        return [], "", "File is too big for Telegram (50 MB) even after compression."
-    caption = f"{title}\n👤 {uploader}\n🔗 {url}" if title else f"🔗 {url}"
-    return ready, caption[:1000], None
+        return [], "", {"user": "This file is too big for Telegram (50 MB) even after compression.",
+                        "raw": "too big", "report": False}
+    lines = [title] if title else []
+    if uploader:
+        lines.append(f"👤 {uploader}")
+    lines.append(f"🔗 {url}")
+    caption = "\n".join(lines)[:880] + FOOTER
+    return ready, caption, None
 
 
 def send_file(chat_id, path, caption):
@@ -323,6 +381,15 @@ def send_file(chat_id, path, caption):
 
 
 # ---------- Core actions ----------
+def fail(chat_id, uid, url, err, where="download"):
+    if err.get("report"):
+        code = new_code(err["raw"])
+        say(chat_id, f"❌ {err['user']}\nError code: {code}\nStill stuck? Contact @mindmaster_robot")
+        report_error(code, where, uid, url, err["raw"])
+    else:
+        say(chat_id, f"❌ {err['user']}")
+
+
 def deliver(chat_id, uid, url, mode):
     c = cache_get(url, mode)
     if c:
@@ -338,7 +405,7 @@ def deliver(chat_id, uid, url, mode):
     try:
         files, caption, err = prepare(url, mode, tmp)
         if err:
-            say(chat_id, err)
+            fail(chat_id, uid, url, err)
             return
         sent = []
         for i, f in enumerate(files):
@@ -346,7 +413,8 @@ def deliver(chat_id, uid, url, mode):
             if r:
                 sent.append(r)
         if not sent:
-            say(chat_id, "Upload failed. Please try again.")
+            fail(chat_id, uid, url, {"user": "Upload to Telegram failed.", "raw": "send_file returned nothing",
+                                     "report": True}, "upload")
             return
         count_download()
         if len(files) == 1:
@@ -382,9 +450,34 @@ def broadcast(admin_chat, text):
     say(admin_chat, f"Broadcast done: {ok} sent, {fail} failed.")
 
 
-HELP = ("Send me a link from YouTube, Instagram, TikTok, X, Facebook, Reddit, Pinterest and more.\n\n"
-        "/audio <link> - MP3 only\n"
-        f"Limit: {RATE_LIMIT} downloads per hour, files are compressed to fit 50 MB.")
+def start_text():
+    return (
+        "👋 <b>Welcome to ThunderDL!</b>\n"
+        "Send me a link and I'll download it for you. Free, fast, no login.\n\n"
+        "<b>Supported</b>\n"
+        "🟢 YouTube: video, Shorts, MP3\n"
+        "🟢 Instagram: reels, posts, photos\n"
+        "🟢 TikTok\n"
+        "🟢 X / Twitter\n"
+        "🟢 Facebook\n"
+        "🟢 Pinterest: videos and images\n"
+        "🟢 Reddit\n"
+        "🟢 Vimeo, Threads, Twitch, Dailymotion\n\n"
+        "<b>Not supported</b>\n"
+        "🔴 Private or login-only posts\n"
+        "🔴 Instagram Stories\n"
+        "🔴 Netflix, Prime Video, Hotstar (DRM)\n"
+        "🔴 Spotify and Apple Music (DRM)\n"
+        "🔴 Live streams\n\n"
+        "🎵 Use <code>/audio link</code> for MP3 only.\n"
+        f"📦 Limit: {RATE_LIMIT} downloads per hour, files up to 50 MB (bigger videos are compressed).\n\n"
+        "Made with ❤️ by @wondermayank"
+    )
+
+
+START_KEYBOARD = {"inline_keyboard": [
+    [{"text": "🌐 Website", "url": WEBSITE}, {"text": "💬 Contact", "url": CONTACT}],
+    [{"text": "👨‍💻 Made by @wondermayank", "url": MADE_BY}]]}
 
 
 def handle_message(msg):
@@ -398,7 +491,7 @@ def handle_message(msg):
         register(chat_id)
     cmd = text.split()[0].split("@")[0].lower() if text.startswith("/") else ""
     if cmd in ("/start", "/help"):
-        say(chat_id, HELP)
+        say(chat_id, start_text(), parse_mode="HTML", reply_markup=START_KEYBOARD)
         return
     if cmd == "/stats" and uid in ADMINS:
         day = time.time() - 86400
@@ -425,6 +518,8 @@ def handle_message(msg):
         return
     if cmd == "/audio":
         deliver(chat_id, uid, url, "audio")
+    elif is_image_only(url):
+        deliver(chat_id, uid, url, "image")
     else:
         picker(chat_id, msg["message_id"])
 
@@ -496,7 +591,11 @@ def handle_chosen(ch):
     try:
         files, caption, err = prepare(url, "720", tmp)
         if err:
-            tg("editMessageText", inline_message_id=imid, text=err)
+            code = new_code(err["raw"]) if err.get("report") else ""
+            tg("editMessageText", inline_message_id=imid,
+               text=f"❌ {err['user']}" + (f"\nError code: {code}" if code else ""))
+            if code:
+                report_error(code, "inline", uid, url, err["raw"])
             return
         r = send_file(STORAGE_CHAT, files[0], caption)
         if not r:
@@ -515,6 +614,8 @@ def safe(fn, arg):
         fn(arg)
     except Exception as e:
         print("handler error:", fn.__name__, e)
+        raw = traceback.format_exc()[-1200:]
+        report_error(new_code(raw), fn.__name__, "-", "-", raw)
 
 
 def dispatch(u, pool):
