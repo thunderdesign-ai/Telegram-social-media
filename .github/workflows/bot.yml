@@ -23,10 +23,14 @@ jobs:
         with:
           python-version: "3.12"
 
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
       - name: Install dependencies
         run: |
           sudo apt-get update && sudo apt-get install -y ffmpeg
-          pip install -U yt-dlp requests
+          pip install -U "yt-dlp[default]" requests
 
       - name: Write cookies (optional)
         env:
