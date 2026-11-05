@@ -1,5 +1,6 @@
 import glob
 import hashlib
+import html
 import json
 import os
 import re
@@ -208,6 +209,9 @@ def download(url, outdir, mode):
     if mode == "audio":
         opts["format"] = "bestaudio/best"
         opts["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}]
+    elif mode == "mute":
+        opts["format"] = "bv*[height<=720]/bv*/b"
+        opts["merge_output_format"] = "mp4"
     else:
         h = int(mode)
         opts["format"] = f"bv*[height<={h}]+ba/b[height<={h}]/b"
@@ -220,6 +224,39 @@ def download(url, outdir, mode):
     title = first.get("title") or info.get("title") or ""
     uploader = first.get("uploader") or info.get("uploader") or ""
     return sorted(glob.glob(os.path.join(outdir, "*"))), title, uploader
+
+
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+
+
+def meta(html_text, prop):
+    for pat in (r'<meta[^>]+(?:property|name)=["\']%s["\'][^>]+content=["\']([^"\']+)',
+                r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\']%s["\']'):
+        m = re.search(pat % prop, html_text)
+        if m:
+            return html.unescape(m.group(1))
+    return ""
+
+
+def page_fallback(url, outdir):
+    """For image posts yt-dlp can't handle (Pinterest, Instagram photos...): grab the page's main image."""
+    r = requests.get(url, headers={"User-Agent": UA}, timeout=30, allow_redirects=True)
+    text = r.text
+    img = meta(text, "og:image")
+    if not img:
+        raise RuntimeError("no image found")
+    candidates = [img]
+    if "pinimg.com" in img:
+        candidates.insert(0, re.sub(r"/\d+x(\d+)?/", "/originals/", img))
+    for c in candidates:
+        resp = requests.get(c, headers={"User-Agent": UA}, timeout=60)
+        if resp.status_code == 200 and resp.content:
+            ext = os.path.splitext(urlparse(c).path)[1] or ".jpg"
+            path = os.path.join(outdir, "image" + ext)
+            with open(path, "wb") as f:
+                f.write(resp.content)
+            return [path], meta(text, "og:title"), ""
+    raise RuntimeError("image download failed")
 
 
 def compress(path):
@@ -244,10 +281,21 @@ def compress(path):
 
 
 def prepare(url, mode, tmp):
+    host = (urlparse(url).hostname or "").lower()
     try:
         files, title, uploader = download(url, tmp, mode)
     except Exception as e:
-        return [], "", f"Failed: {str(e)[:300]}"
+        err = str(e)
+        files = None
+        if mode != "audio" and "youtu" not in host:
+            try:
+                files, title, uploader = page_fallback(url, tmp)
+            except Exception as e2:
+                print("fallback failed:", e2)
+        if not files:
+            if "youtu" in host and ("Sign in" in err or "bot" in err):
+                return [], "", "YouTube is blocking this server right now. Please try another site or try again later."
+            return [], "", f"Failed: {err[:300]}"
     if not files:
         return [], "", "Nothing found to download."
     ready = []
@@ -312,9 +360,10 @@ def deliver(chat_id, uid, url, mode):
 
 def picker(chat_id, msg_id):
     say(chat_id, "Choose quality:", reply_to_message_id=msg_id, reply_markup={"inline_keyboard": [
-        [{"text": "360p", "callback_data": "q:360"}, {"text": "720p", "callback_data": "q:720"},
-         {"text": "1080p", "callback_data": "q:1080"}],
-        [{"text": "🎵 Audio (MP3)", "callback_data": "q:audio"}]]})
+        [{"text": "360p", "callback_data": "q:360"}, {"text": "480p", "callback_data": "q:480"},
+         {"text": "720p", "callback_data": "q:720"}, {"text": "1080p", "callback_data": "q:1080"}],
+        [{"text": "🎵 Audio (MP3)", "callback_data": "q:audio"},
+         {"text": "🔇 Video only", "callback_data": "q:mute"}]]})
 
 
 def broadcast(admin_chat, text):
@@ -400,8 +449,11 @@ def handle_callback(cb):
     if not urls:
         say(chat_id, "That request expired. Please send the link again.")
         return
+    mode = d[2:]
+    if mode not in ("360", "480", "720", "1080", "audio", "mute"):
+        return
     tg("deleteMessage", chat_id=chat_id, message_id=msg["message_id"])
-    deliver(chat_id, uid, urls[0].rstrip(").,"), d[2:])
+    deliver(chat_id, uid, urls[0].rstrip(").,"), mode)
 
 
 # ---------- Inline mode ----------
