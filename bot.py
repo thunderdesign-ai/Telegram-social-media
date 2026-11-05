@@ -18,10 +18,13 @@ from yt_dlp import YoutubeDL
 
 TOKEN = os.environ["BOT_TOKEN"]
 API = f"https://api.telegram.org/bot{TOKEN}"
-ADMINS = {int(x) for x in (os.environ.get("ADMIN_IDS") or "1215136695").split(",") if x.strip()}
-CHANNEL_ID = int(os.environ.get("CHANNEL_ID") or "-1001947409796")
-CHANNEL_URL = os.environ.get("CHANNEL_URL") or "https://t.me/wondermayank"
-STORAGE_CHAT = int(os.environ.get("STORAGE_CHAT") or next(iter(ADMINS)))  # used by inline mode
+# All of these come from environment variables (GitHub repo Variables). No defaults on purpose.
+ADMINS = {int(x) for x in (os.environ.get("ADMIN_IDS") or "").split(",") if x.strip()}
+CHANNEL_ID = int(os.environ.get("CHANNEL_ID") or "0")  # 0 = join gate off
+CHANNEL_URL = os.environ.get("CHANNEL_URL") or ""
+LOG_CHAT = int(os.environ.get("LOG_CHAT") or "0")  # moderation log group (0 = off)
+STORAGE_CHAT = int(os.environ.get("STORAGE_CHAT") or LOG_CHAT or (next(iter(ADMINS)) if ADMINS else 0))
+STRIKE_LIMIT = int(os.environ.get("STRIKE_LIMIT") or "3")  # 18+ attempts before an automatic ban
 GIST_ID = os.environ.get("GIST_ID", "")
 GIST_TOKEN = os.environ.get("GIST_TOKEN", "")
 RATE_LIMIT = int(os.environ.get("RATE_LIMIT") or "5")  # downloads per user per hour
@@ -45,7 +48,7 @@ MADE_BY = "https://t.me/wondermayank"
 METHOD = {"photo": "sendPhoto", "video": "sendVideo", "audio": "sendAudio", "document": "sendDocument"}
 
 lock = threading.Lock()
-data = {"users": {}, "downloads": 0, "cache": {}}
+data = {"users": {}, "downloads": 0, "cache": {}, "banned": {}, "strikes": {}}
 dirty = False
 hits = {}
 joined_cache = {}
@@ -83,7 +86,7 @@ def load_data():
         text = f["content"] if not f.get("truncated") else requests.get(f["raw_url"], headers=gh(), timeout=30).text
         loaded = json.loads(text or "{}")
         data.update(loaded)
-        for k, v in (("users", {}), ("downloads", 0), ("cache", {})):
+        for k, v in (("users", {}), ("downloads", 0), ("cache", {}), ("banned", {}), ("strikes", {})):
             data.setdefault(k, v)
         print("Loaded data:", len(data["users"]), "users")
     except Exception as e:
@@ -147,6 +150,84 @@ def count_download():
         touch()
 
 
+# ---------- Moderation ----------
+ADULT_RE = re.compile(
+    r"\b(porn\w*|xvideos|xnxx|xhamster|onlyfans|hentai|nsfw|xxx|sex[\s_-]?tape|erotic)\b", re.I)
+
+
+def adult_reason(url, title="", uploader="", age=0):
+    if age and age >= 18:
+        return "age-restricted (18+)"
+    if ADULT_RE.search(f"{url} {title} {uploader}"):
+        return "adult keyword"
+    return ""
+
+
+def is_banned(uid):
+    return str(uid) in data["banned"] and uid not in ADMINS
+
+
+def ban(uid):
+    if uid in ADMINS:
+        return
+    with lock:
+        data["banned"][str(uid)] = int(time.time())
+        touch()
+
+
+def unban(uid):
+    with lock:
+        data["banned"].pop(str(uid), None)
+        data["strikes"].pop(str(uid), None)
+        touch()
+
+
+def who(user):
+    name = " ".join(x for x in [user.get("first_name"), user.get("last_name")] if x) or "-"
+    uname = f" @{user['username']}" if user.get("username") else ""
+    return f"{name}{uname} ({user.get('id')})"
+
+
+def ban_button(uid):
+    return {"inline_keyboard": [[{"text": "🚫 Ban user", "callback_data": f"ban:{uid}"}]]}
+
+
+def log_download(user, url, mode, items):
+    """Copy of each download goes to the moderation group (users are told about this in /start)."""
+    if not LOG_CHAT or not items:
+        return
+    cap = f"📥 {who(user)}\n🎚 {mode}\n🔗 {url}"[:1000]
+    for i, it in enumerate(items[:10]):
+        extra = {"caption": cap, "reply_markup": ban_button(user["id"])} if i == 0 else {}
+        tg(METHOD[it["kind"]], chat_id=LOG_CHAT, **{it["kind"]: it["file_id"]}, **extra)
+
+
+def flag(chat_id, user, url, reason):
+    """18+ content: block it, add a strike, auto-ban after STRIKE_LIMIT, alert the owner."""
+    uid = user["id"]
+    with lock:
+        n = data["strikes"].get(str(uid), 0) + 1
+        data["strikes"][str(uid)] = n
+        touch()
+    banned_now = False
+    if n >= STRIKE_LIMIT and uid not in ADMINS:
+        ban(uid)
+        banned_now = True
+    if chat_id:
+        if banned_now:
+            say(chat_id, "🚫 You have been banned for repeated 18+ requests. "
+                         "If this is a mistake, contact @mindmaster_robot.")
+        else:
+            say(chat_id, f"🚫 18+ content is not allowed. Warning {n}/{STRIKE_LIMIT}.")
+    alert = (f"🚨 18+ blocked ({reason})\nUser: {who(user)}\nStrikes: {n}/{STRIKE_LIMIT}"
+             f"{' (auto-banned)' if banned_now else ''}\nLink: {url}")
+    if LOG_CHAT:
+        say(LOG_CHAT, alert, reply_markup=ban_button(uid))
+    else:
+        for a in ADMINS:
+            say(a, alert, reply_markup=ban_button(uid))
+
+
 # ---------- Rules ----------
 def allowed_site(url):
     host = (urlparse(url).hostname or "").lower()
@@ -168,7 +249,7 @@ def over_limit(uid):
 
 
 def is_joined(uid):
-    if uid in ADMINS:
+    if uid in ADMINS or not CHANNEL_ID:  # CHANNEL_ID=0 turns the join gate off
         return True
     ts = joined_cache.get(uid)
     if ts and time.time() - ts < 600:
@@ -228,7 +309,8 @@ def download(url, outdir, mode):
         first = next((e for e in info["entries"] if e), {})
     title = first.get("title") or info.get("title") or ""
     uploader = first.get("uploader") or info.get("uploader") or ""
-    return sorted(glob.glob(os.path.join(outdir, "*"))), title, uploader
+    age = first.get("age_limit") or info.get("age_limit") or 0
+    return sorted(glob.glob(os.path.join(outdir, "*"))), title, uploader, age
 
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
@@ -260,7 +342,7 @@ def page_fallback(url, outdir):
             path = os.path.join(outdir, "image" + ext)
             with open(path, "wb") as f:
                 f.write(resp.content)
-            return [path], meta(text, "og:title"), ""
+            return [path], meta(text, "og:title"), "", 0
     raise RuntimeError("image download failed")
 
 
@@ -327,20 +409,20 @@ def compress(path):
 def prepare(url, mode, tmp):
     """Returns (files, caption, error). error is None or {"user", "raw", "report"}."""
     host = (urlparse(url).hostname or "").lower()
-    files, title, uploader = None, "", ""
+    files, title, uploader, age = None, "", "", 0
     if mode == "image":
         try:
-            files, title, uploader = page_fallback(url, tmp)
+            files, title, uploader, age = page_fallback(url, tmp)
         except Exception as e:
             return [], "", {"user": "Couldn't fetch this image.", "raw": str(e), "report": True}
     else:
         try:
-            files, title, uploader = download(url, tmp, mode)
+            files, title, uploader, age = download(url, tmp, mode)
         except Exception as e:
             raw = str(e)
             if mode not in ("audio", "mute") and "youtu" not in host:
                 try:
-                    files, title, uploader = page_fallback(url, tmp)
+                    files, title, uploader, age = page_fallback(url, tmp)
                 except Exception as e2:
                     print("fallback failed:", e2)
             if not files:
@@ -351,6 +433,9 @@ def prepare(url, mode, tmp):
                                 "raw": raw, "report": True}
     if not files:
         return [], "", {"user": "Nothing found to download.", "raw": "no files", "report": False}
+    reason = adult_reason(url, title, uploader, age)
+    if reason:
+        return [], "", {"user": "", "raw": reason, "report": False, "flag": reason}
     ready = []
     for f in files:
         if os.path.getsize(f) > MAX_BYTES and kind_of(f) == "video":
@@ -381,21 +466,26 @@ def send_file(chat_id, path, caption):
 
 
 # ---------- Core actions ----------
-def fail(chat_id, uid, url, err, where="download"):
+def fail(chat_id, user, url, err, where="download"):
+    if err.get("flag"):
+        flag(chat_id, user, url, err["flag"])
+        return
     if err.get("report"):
         code = new_code(err["raw"])
         say(chat_id, f"❌ {err['user']}\nError code: {code}\nStill stuck? Contact @mindmaster_robot")
-        report_error(code, where, uid, url, err["raw"])
+        report_error(code, where, user["id"], url, err["raw"])
     else:
         say(chat_id, f"❌ {err['user']}")
 
 
-def deliver(chat_id, uid, url, mode):
+def deliver(chat_id, uid, url, mode, user=None):
+    user = user or {"id": uid}
     c = cache_get(url, mode)
     if c:
         res = tg(METHOD[c["kind"]], chat_id=chat_id, caption=c["caption"], **{c["kind"]: c["file_id"]})
         if res.get("ok"):
             count_download()
+            log_download(user, url, mode, [c])
             return
     if over_limit(uid):
         say(chat_id, f"Limit reached ({RATE_LIMIT}/hour). Please try again later.")
@@ -405,7 +495,7 @@ def deliver(chat_id, uid, url, mode):
     try:
         files, caption, err = prepare(url, mode, tmp)
         if err:
-            fail(chat_id, uid, url, err)
+            fail(chat_id, user, url, err)
             return
         sent = []
         for i, f in enumerate(files):
@@ -413,10 +503,11 @@ def deliver(chat_id, uid, url, mode):
             if r:
                 sent.append(r)
         if not sent:
-            fail(chat_id, uid, url, {"user": "Upload to Telegram failed.", "raw": "send_file returned nothing",
-                                     "report": True}, "upload")
+            fail(chat_id, user, url, {"user": "Upload to Telegram failed.", "raw": "send_file returned nothing",
+                                      "report": True}, "upload")
             return
         count_download()
+        log_download(user, url, mode, sent)
         if len(files) == 1:
             cache_put(url, mode, sent[0])
     finally:
@@ -470,7 +561,8 @@ def start_text():
         "🔴 Spotify and Apple Music (DRM)\n"
         "🔴 Live streams\n\n"
         "🎵 Use <code>/audio link</code> for MP3 only.\n"
-        f"📦 Limit: {RATE_LIMIT} downloads per hour, files up to 50 MB (bigger videos are compressed).\n\n"
+        f"📦 Limit: {RATE_LIMIT} downloads per hour, files up to 50 MB (bigger videos are compressed).\n"
+        "🔒 Downloads are logged for abuse prevention. 18+ content is blocked and repeat attempts get banned.\n\n"
         "Made with ❤️ by @wondermayank"
     )
 
@@ -487,6 +579,10 @@ def handle_message(msg):
     text = msg.get("text") or ""
     if not chat_id or not uid:
         return
+    if is_banned(uid):
+        say(chat_id, "🚫 You are banned from using this bot. Contact @mindmaster_robot if this is a mistake.")
+        return
+    user = msg.get("from") or {"id": uid}
     if chat.get("type") == "private":
         register(chat_id)
     cmd = text.split()[0].split("@")[0].lower() if text.startswith("/") else ""
@@ -497,7 +593,8 @@ def handle_message(msg):
         day = time.time() - 86400
         new = sum(1 for t in data["users"].values() if t > day)
         say(chat_id, f"👥 Users: {len(data['users'])} (+{new} in 24h)\n"
-                     f"⬇️ Downloads: {data['downloads']}\n🗂 Cached links: {len(data['cache'])}")
+                     f"⬇️ Downloads: {data['downloads']}\n🗂 Cached links: {len(data['cache'])}\n"
+                     f"🚫 Banned: {len(data['banned'])}")
         return
     if cmd == "/broadcast" and uid in ADMINS:
         body = text.partition(" ")[2].strip()
@@ -505,6 +602,18 @@ def handle_message(msg):
             broadcast(chat_id, body)
         else:
             say(chat_id, "Usage: /broadcast your message")
+        return
+    if cmd in ("/ban", "/unban") and uid in ADMINS:
+        arg = text.partition(" ")[2].strip()
+        if not arg.lstrip("-").isdigit():
+            say(chat_id, f"Usage: {cmd} <user_id>")
+            return
+        if cmd == "/ban":
+            ban(int(arg))
+            say(chat_id, f"🚫 Banned {arg}")
+        else:
+            unban(int(arg))
+            say(chat_id, f"✅ Unbanned {arg}")
         return
     urls = URL_RE.findall(text)
     if not urls:
@@ -516,10 +625,14 @@ def handle_message(msg):
     if not allowed_site(url):
         say(chat_id, "That site isn't supported.")
         return
+    reason = adult_reason(url)
+    if reason:
+        flag(chat_id, user, url, reason)
+        return
     if cmd == "/audio":
-        deliver(chat_id, uid, url, "audio")
+        deliver(chat_id, uid, url, "audio", user)
     elif is_image_only(url):
-        deliver(chat_id, uid, url, "image")
+        deliver(chat_id, uid, url, "image", user)
     else:
         picker(chat_id, msg["message_id"])
 
@@ -529,6 +642,16 @@ def handle_callback(cb):
     d = cb.get("data", "")
     msg = cb.get("message") or {}
     chat_id = (msg.get("chat") or {}).get("id")
+    if d.startswith("ban:"):
+        ok = uid in ADMINS and d[4:].lstrip("-").isdigit()
+        if ok:
+            ban(int(d[4:]))
+        tg("answerCallbackQuery", callback_query_id=cb["id"], show_alert="true",
+           text=f"🚫 Banned {d[4:]}" if ok else "Admins only.")
+        return
+    if is_banned(uid):
+        tg("answerCallbackQuery", callback_query_id=cb["id"], text="You are banned.", show_alert="true")
+        return
     if d == "chk":
         ok = is_joined(uid)
         tg("answerCallbackQuery", callback_query_id=cb["id"],
@@ -548,13 +671,13 @@ def handle_callback(cb):
     if mode not in ("360", "480", "720", "1080", "audio", "mute"):
         return
     tg("deleteMessage", chat_id=chat_id, message_id=msg["message_id"])
-    deliver(chat_id, uid, urls[0].rstrip(").,"), mode)
+    deliver(chat_id, uid, urls[0].rstrip(").,"), mode, cb["from"])
 
 
 # ---------- Inline mode ----------
 def handle_inline_query(q):
     urls = URL_RE.findall(q.get("query", ""))
-    if not urls or not allowed_site(urls[0]):
+    if is_banned(q["from"]["id"]) or not urls or not allowed_site(urls[0]):
         tg("answerInlineQuery", inline_query_id=q["id"], results=[], cache_time=5,
            button={"text": "Paste a video link", "start_parameter": "inline"})
         return
@@ -580,7 +703,16 @@ def handle_chosen(ch):
     if not imid or not urls:
         return
     uid = ch["from"]["id"]
+    user = ch["from"]
     url = urls[0].rstrip(").,")
+    if is_banned(uid):
+        tg("editMessageText", inline_message_id=imid, text="🚫 You are banned from using this bot.")
+        return
+    reason = adult_reason(url)
+    if reason:
+        tg("editMessageText", inline_message_id=imid, text="🚫 18+ content is not allowed.")
+        flag(None, user, url, reason)
+        return
     if not is_joined(uid):
         tg("editMessageText", inline_message_id=imid, text="Please join " + CHANNEL_URL + " to use this bot.")
         return
@@ -590,6 +722,10 @@ def handle_chosen(ch):
     tmp = tempfile.mkdtemp()
     try:
         files, caption, err = prepare(url, "720", tmp)
+        if err and err.get("flag"):
+            tg("editMessageText", inline_message_id=imid, text="🚫 18+ content is not allowed.")
+            flag(None, user, url, err["flag"])
+            return
         if err:
             code = new_code(err["raw"]) if err.get("report") else ""
             tg("editMessageText", inline_message_id=imid,
@@ -602,6 +738,7 @@ def handle_chosen(ch):
             tg("editMessageText", inline_message_id=imid, text="Upload failed.")
             return
         count_download()
+        log_download(user, url, "720 (inline)", [r])
         cache_put(url, "720", r)
         tg("editMessageMedia", inline_message_id=imid,
            media={"type": r["kind"], "media": r["file_id"], "caption": caption})
